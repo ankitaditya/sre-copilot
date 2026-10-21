@@ -211,6 +211,13 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
+# SRE Copilot local state
+data/
+ui/node_modules/
+ui/dist/
+*.sqlite
+*.sqlite3
+
 # Marimo
 marimo/_static/
 marimo/_lsp/

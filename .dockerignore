@@ -1,0 +1,11 @@
+.git
+.github
+.agents
+.venv
+data
+ui/node_modules
+ui/dist
+__pycache__
+.pytest_cache
+.ruff_cache
+*.pyc

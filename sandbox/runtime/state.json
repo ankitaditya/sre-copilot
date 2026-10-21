@@ -1,0 +1,17 @@
+{
+  "service": "demo-api",
+  "fault": "db-down",
+  "symptoms": [
+    "HTTP 503 responses",
+    "database connection refused",
+    "readiness probe failing"
+  ],
+  "last_changed_at": "2026-10-21T10:00:00+00:00",
+  "logs": [
+    "2026-10-21T09:59:51+00:00 INFO demo-api started on port 8080",
+    "2026-10-21T10:00:00+00:00 WARN chaos scenario db-down activated",
+    "2026-10-21T10:00:01+00:00 ERROR database connection refused host=postgres port=5432",
+    "2026-10-21T10:00:02+00:00 ERROR readiness check failed dependency=postgres",
+    "2026-10-21T10:00:03+00:00 WARN request completed status=503 path=/orders"
+  ]
+}

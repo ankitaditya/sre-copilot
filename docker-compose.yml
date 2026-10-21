@@ -1,0 +1,23 @@
+services:
+  sre-copilot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sre-copilot:local
+    container_name: sre-copilot
+    environment:
+      ENVIRONMENT: production
+      LLM_MODE: ${LLM_MODE:-auto}
+      OLLAMA_BASE_URL: ${DOCKER_OLLAMA_BASE_URL:-http://host.docker.internal:11434}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5:7b-instruct}
+    ports:
+      - "${PORT:-8000}:8000"
+    volumes:
+      - sre-copilot-data:/app/data
+      - ./sandbox/runtime:/app/sandbox/runtime
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+volumes:
+  sre-copilot-data:
