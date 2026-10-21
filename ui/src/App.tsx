@@ -20,6 +20,8 @@ import { useNavigate, useParams } from "react-router-dom";
 
 import { api, errorMessage } from "./api/client";
 import { CreateRunDialog } from "./components/CreateRunDialog";
+import { useAuth } from "./components/AuthGate";
+import { KnowledgePanel } from "./components/KnowledgePanel";
 import { KpiCards } from "./components/KpiCards";
 import { RunDetail } from "./components/RunDetail";
 import { RunSidebar } from "./components/RunSidebar";
@@ -128,6 +130,7 @@ export interface AppProps {
 }
 
 export default function App({ darkMode, onToggleTheme }: AppProps) {
+  const { canOperate } = useAuth();
   const styles = useStyles();
   const navigate = useNavigate();
   const { runId } = useParams<{ runId: string }>();
@@ -261,6 +264,7 @@ export default function App({ darkMode, onToggleTheme }: AppProps) {
             </div>
             <Button
               appearance="primary"
+              disabled={!canOperate}
               icon={<Add24Regular />}
               onClick={() => setCreateOpen(true)}
             >
@@ -273,6 +277,7 @@ export default function App({ darkMode, onToggleTheme }: AppProps) {
             loading={runsLoading}
             toolCount={toolCount}
           />
+          <KnowledgePanel />
 
           {runsError && (
             <MessageBar intent="error">
@@ -323,6 +328,7 @@ export default function App({ darkMode, onToggleTheme }: AppProps) {
                   </Body1>
                   <Button
                     appearance="primary"
+                    disabled={!canOperate}
                     icon={<Add24Regular />}
                     onClick={() => setCreateOpen(true)}
                   >

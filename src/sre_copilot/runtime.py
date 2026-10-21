@@ -3,9 +3,13 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from typing import Any
+from functools import partial
+from typing import Any, Literal
+
+import httpx
 
 from sre_copilot.config import Settings
+from sre_copilot.knowledge import KnowledgeIndex
 from sre_copilot.llm import OllamaReasoner
 from sre_copilot.models import (
     Budget,
@@ -16,6 +20,7 @@ from sre_copilot.models import (
     RunState,
     RunStatus,
 )
+from sre_copilot.protection import PolicyViolation
 from sre_copilot.store import RunStore
 from sre_copilot.tools import ToolRegistry
 
@@ -39,12 +44,28 @@ class AgentRuntime:
         self._store = store
         self._tools = tools
         self._reasoner = OllamaReasoner(settings)
+        self.knowledge = KnowledgeIndex(settings, store)
+        self._tools.knowledge = self.knowledge
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._closing = False
 
     async def start(self) -> None:
+        await self.knowledge.rebuild()
         for state in await self._store.list_recoverable_runs():
+            if state.action_execution_id is not None:
+                state.status = RunStatus.NEEDS_HUMAN
+                state.pending_action = None
+                state.current_step = next(
+                    index for index, step in enumerate(state.plan) if step.id == "verify"
+                )
+                state.summary = "Action execution was interrupted. Resume to verify before any new change."
+                await self._store.add_event(state.id, "security_blocked", {
+                    "code": "interrupted_action_requires_verification",
+                    "action_id": state.action_execution_id,
+                })
+                await self._store.save_run(state, "interrupted_action")
+                continue
             await self._store.add_event(
                 state.id,
                 "run_recovered",
@@ -61,6 +82,11 @@ class AgentRuntime:
             await asyncio.gather(*tasks, return_exceptions=True)
 
     async def create_run(self, request: CreateRunRequest) -> RunState:
+        self._tools.policy.service(request.service)
+        original = request.model_dump(mode="json")
+        request = CreateRunRequest.model_validate(
+            self._tools.policy.data.clean(original)
+        )
         run_id = str(uuid.uuid4())
         state = RunState(
             id=run_id,
@@ -101,6 +127,8 @@ class AgentRuntime:
             ],
         )
         await self._store.create_run(state)
+        if original != request.model_dump(mode="json"):
+            await self._store.add_event(state.id, "dlp_redacted", {"source": "incident_input"})
         await self._store.add_event(
             state.id,
             "run_created",
@@ -124,9 +152,11 @@ class AgentRuntime:
                 raise RuntimeConflict("Run is not awaiting approval.")
             if action.id != action_id:
                 raise RuntimeConflict("Approval does not match the pending action.")
-            if edited_args is not None:
-                action.args = edited_args
+            action.args = self._tools.validate(
+                action.tool, edited_args if edited_args is not None else action.args, state.service
+            )
             state.status = RunStatus.RUNNING
+            state.action_execution_id = action.id
             await self._store.add_event(
                 run_id,
                 "action_approved",
@@ -137,9 +167,13 @@ class AgentRuntime:
                     "message": "Operator approved the proposed change.",
                 },
             )
-            result, event_id = await self._execute_tool(state, action.tool, action.args)
+            await self._store.save_run(state, "action_execution_started")
+            result, event_id = await self._execute_tool(
+                state, action.tool, action.args, approved_action_id=action.id
+            )
             state.last_observation = result
             state.pending_action = None
+            state.action_execution_id = None
             if result["ok"]:
                 state.plan[state.current_step].status = "completed"
                 state.plan[state.current_step].notes = "Approved remediation executed."
@@ -149,7 +183,9 @@ class AgentRuntime:
                     f"{action.tool}: {result.get('error', 'unknown error')}"
                 )
                 state.plan[state.current_step].status = "failed"
-                state.current_step = 1
+                state.current_step = next(
+                    index for index, step in enumerate(state.plan) if step.id == "evidence"
+                )
                 await self._store.add_event(
                     run_id,
                     "replan",
@@ -170,7 +206,7 @@ class AgentRuntime:
                 raise RuntimeConflict("Run is not awaiting approval.")
             if action.id != action_id:
                 raise RuntimeConflict("Rejection does not match the pending action.")
-            note = reason or "Operator rejected the proposed action."
+            note = self._tools.policy.data.clean(reason or "Operator rejected the proposed action.")
             state.operator_notes.append(note)
             state.failed_attempts.append(f"rejected {action.tool}: {note}")
             state.pending_action = None
@@ -190,6 +226,7 @@ class AgentRuntime:
             return state
 
     async def add_guidance(self, run_id: str, message: str) -> RunState:
+        message = self._tools.policy.data.clean(message)
         async with self._lock_for(run_id):
             state = await self._required_run(run_id)
             if state.status in TERMINAL_STATUSES:
@@ -197,7 +234,9 @@ class AgentRuntime:
             state.operator_notes.append(message)
             if state.status == RunStatus.NEEDS_HUMAN:
                 state.status = RunStatus.RUNNING
-                state.current_step = min(2, len(state.plan) - 1)
+                state.current_step = next(
+                    index for index, step in enumerate(state.plan) if step.id == "diagnose"
+                )
             await self._store.add_event(
                 run_id,
                 "operator_guidance",
@@ -250,12 +289,32 @@ class AgentRuntime:
     async def update_plan(self, run_id: str, steps: list[PlanStep]) -> RunState:
         if not steps:
             raise RuntimeConflict("A run must retain at least one plan step.")
+        steps = [
+            PlanStep.model_validate(self._tools.policy.data.clean(step.model_dump()))
+            for step in steps
+        ]
+        required = ["scope", "evidence", "diagnose", "remediate", "verify"]
+        identifiers = [step.id for step in steps]
+        if (
+            len(steps) > 32 or len(set(identifiers)) != len(identifiers)
+            or [identifier for identifier in identifiers if identifier in required] != required
+        ):
+            raise PolicyViolation("plan_must_preserve_safety_stages")
         async with self._lock_for(run_id):
             state = await self._required_run(run_id)
             if state.status in TERMINAL_STATUSES:
                 raise RuntimeConflict("Cannot edit the plan of a terminal run.")
+            if state.status != RunStatus.PAUSED or state.pending_action is not None:
+                raise RuntimeConflict("Pause the run before editing; pending approvals lock the plan.")
+            current_id = state.plan[state.current_step].id
+            if current_id not in identifiers:
+                raise PolicyViolation("current_plan_step_cannot_be_removed")
+            previous = {step.id: step for step in state.plan}
+            for step in steps:
+                step.status = previous[step.id].status if step.id in previous else "pending"
+                step.notes = previous[step.id].notes if step.id in previous else None
             state.plan = steps
-            state.current_step = min(state.current_step, len(steps) - 1)
+            state.current_step = identifiers.index(current_id)
             await self._store.add_event(
                 run_id,
                 "plan_updated",
@@ -272,7 +331,7 @@ class AgentRuntime:
             return
         task = asyncio.create_task(self._drive(run_id), name=f"agent-run-{run_id}")
         self._tasks[run_id] = task
-        task.add_done_callback(lambda completed, rid=run_id: self._task_done(rid, completed))
+        task.add_done_callback(partial(self._task_done, run_id))
 
     def _task_done(self, run_id: str, task: asyncio.Task[None]) -> None:
         self._tasks.pop(run_id, None)
@@ -307,8 +366,19 @@ class AgentRuntime:
                     return
                 state.status = RunStatus.RUNNING
                 state.budget.steps_used += 1
-                await self._run_current_step(state)
+                try:
+                    self._tools.policy.service(state.service)
+                    await self._run_current_step(state)
+                except PolicyViolation as exc:
+                    state.status = RunStatus.NEEDS_HUMAN
+                    state.summary = f"Security policy blocked automation: {exc}."
+                    await self._store.add_event(
+                        run_id, "security_blocked", {"code": str(exc)}
+                    )
+                    await self._store.add_security_event("runtime_policy_denied", str(exc), run_id)
                 await self._store.save_run(state, f"step_{state.current_step}")
+                if state.status == RunStatus.RESOLVED:
+                    await self.knowledge.remember(state)
             await asyncio.sleep(0)
 
     async def _run_current_step(self, state: RunState) -> None:
@@ -356,6 +426,7 @@ class AgentRuntime:
                     "search_runbooks",
                     {"query": f"{state.service} {state.description}"},
                 ),
+                ("search_knowledge", {"query": f"{state.service} {state.description}"}),
             ]
         else:
             calls = [
@@ -365,11 +436,14 @@ class AgentRuntime:
                     "search_runbooks",
                     {"query": f"{state.service} {state.description}"},
                 ),
+                ("search_knowledge", {"query": f"{state.service} {state.description}"}),
             ]
         observations: list[dict[str, Any]] = []
         event_ids: list[int] = []
         for tool, args in calls:
             result, event_id = await self._execute_tool(state, tool, args)
+            if result.get("policy_blocked"):
+                raise PolicyViolation(result["error"])
             observations.append({"tool": tool, "result": result, "event_id": event_id})
             event_ids.append(event_id)
         state.last_observation = {"evidence": observations}
@@ -395,13 +469,34 @@ class AgentRuntime:
 
     async def _diagnose(self, state: RunState) -> None:
         evidence = (state.last_observation or {}).get("evidence", [])
-        model_result = await self._reasoner.analyze(
-            service=state.service,
-            description=state.description,
-            observations=evidence,
-            operator_notes=state.operator_notes,
-        )
+        try:
+            model_result = await self._reasoner.analyze(
+                service=state.service,
+                description=state.description,
+                observations=evidence,
+                operator_notes=state.operator_notes,
+            )
+        except PolicyViolation:
+            raise
+        except (httpx.HTTPError, ValueError, KeyError, TypeError) as exc:
+            await self._store.add_event(
+                state.id, "model_error",
+                {"code": type(exc).__name__, "fallback": self._settings.llm_mode == "auto"},
+            )
+            if self._settings.llm_mode == "ollama":
+                state.status = RunStatus.NEEDS_HUMAN
+                state.summary = "Configured model failed; review the model_error event."
+                return
+            model_result = None
         if model_result:
+            recommendation = model_result.get("recommended_tool")
+            if recommendation is not None:
+                validated = self._tools.validate(
+                    recommendation, model_result.get("recommended_args") or {}, state.service
+                )
+                if self._tools.get(recommendation).definition.risk != "mutating":
+                    raise PolicyViolation("model_recommendation_must_be_mutating")
+                model_result["recommended_args"] = validated
             state.model_provider = f"ollama:{self._settings.ollama_model}"
             root_cause = str(model_result.get("root_cause") or "Model identified an anomaly.")
             confidence = int(model_result.get("confidence") or 60)
@@ -483,6 +578,9 @@ class AgentRuntime:
             return
         recommendation = (state.last_observation or {}).get("model_recommendation") or {}
         recommended_tool = recommendation.get("tool")
+        tool: str
+        args: dict[str, Any]
+        risk: Literal["low", "medium", "high"]
         model_tool_allowed = False
         if isinstance(recommended_tool, str):
             try:
@@ -491,13 +589,10 @@ class AgentRuntime:
                 )
             except KeyError:
                 model_tool_allowed = False
-        if model_tool_allowed:
+        if model_tool_allowed and isinstance(recommended_tool, str):
             tool = recommended_tool
-            args = (
-                recommendation.get("args")
-                if isinstance(recommendation.get("args"), dict)
-                else {}
-            )
+            raw_args = recommendation.get("args")
+            args = raw_args if isinstance(raw_args, dict) else {}
             blast_radius = str(
                 recommendation.get("blast_radius")
                 or f"Bounded to the approved {tool} target."
@@ -514,7 +609,7 @@ class AgentRuntime:
                 if item["tool"] == "inspect_demo_service" and item["result"]["ok"]:
                     fault = item["result"]["data"].get("fault", "unknown")
             tool = "restore_demo_service"
-            args: dict[str, Any] = {"expected_fault": fault}
+            args = {"expected_fault": fault}
             blast_radius = "Only the local demo-api fault state; no external systems."
             risk = "low"
         else:
@@ -527,6 +622,7 @@ class AgentRuntime:
                 f"Evidence supports a bounded {tool} action. The runtime will verify health "
                 "after execution and replan if the signal remains unhealthy."
             )
+        args = self._tools.validate(tool, args, state.service)
         action = PendingAction(
             id=str(uuid.uuid4()),
             tool=tool,
@@ -552,7 +648,13 @@ class AgentRuntime:
             healthy = bool(result.get("ok") and result.get("data", {}).get("healthy"))
         else:
             result, event_id = await self._execute_tool(state, "list_containers", {})
-            healthy = bool(result.get("ok"))
+            containers = result.get("data", {}).get("containers", [])
+            healthy = bool(result.get("ok") and any(
+                item.get("Names") == state.service
+                and item.get("State", "").lower() == "running"
+                and "(unhealthy)" not in item.get("Status", "").lower()
+                for item in containers
+            ))
         state.last_observation = result
         if healthy:
             state.plan[state.current_step].status = "completed"
@@ -589,11 +691,15 @@ class AgentRuntime:
         )
 
     async def _execute_tool(
-        self, state: RunState, tool: str, args: dict[str, Any]
+        self, state: RunState, tool: str, args: dict[str, Any],
+        *, approved_action_id: str | None = None,
     ) -> tuple[dict[str, Any], int]:
+        args = self._tools.validate(tool, args, state.service)
         definition = self._tools.get(tool).definition
         if definition.risk == "mutating" and (
             state.pending_action is None or state.pending_action.tool != tool
+            or state.pending_action.id != approved_action_id
+            or state.pending_action.args != args or state.status != RunStatus.RUNNING
         ):
             raise RuntimeConflict(f"Mutating tool {tool} bypassed the approval gate.")
         attempts = 0
@@ -614,7 +720,18 @@ class AgentRuntime:
                     "attempt": attempts,
                 },
             )
-            result = await self._tools.execute(tool, args)
+            result = await self._tools.execute(
+                tool, args, service=state.service,
+                approved=definition.risk == "mutating" and approved_action_id is not None,
+            )
+            if result.get("policy_blocked"):
+                await self._store.add_event(
+                    state.id, "security_blocked", {"code": result["error"], "tool": tool}
+                )
+            if result.get("redacted"):
+                await self._store.add_event(
+                    state.id, "dlp_redacted", {"source": "tool_output", "tool": tool}
+                )
             event = await self._store.add_event(
                 state.id,
                 "tool_result",

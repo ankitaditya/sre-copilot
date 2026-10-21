@@ -1,11 +1,19 @@
 import type {
   CreateRunInput,
+  AuthSession,
   HealthStatus,
   PlanStep,
   Run,
+  KnowledgeResults,
+  KnowledgeStatus,
 } from "../types";
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || "").replace(/\/$/, "");
+let csrfToken: string | null = null;
+
+export function setAuthSession(session: AuthSession) {
+  csrfToken = session.csrf_token ?? null;
+}
 
 export class ApiError extends Error {
   status: number;
@@ -21,13 +29,16 @@ export class ApiError extends Error {
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const headers = new Headers(init.headers);
+  if (csrfToken && init.method && !["GET", "HEAD"].includes(init.method)) {
+    headers.set("X-CSRF-Token", csrfToken);
+  }
   if (init.body && !headers.has("Content-Type")) {
     headers.set("Content-Type", "application/json");
   }
 
   let response: Response;
   try {
-    response = await fetch(`${API_BASE}${path}`, { ...init, headers });
+    response = await fetch(`${API_BASE}${path}`, { ...init, credentials: "include", headers });
   } catch (error) {
     throw new ApiError(0, "The SRE API is unreachable.", error);
   }
@@ -43,6 +54,9 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   }
 
   if (!response.ok) {
+    if (response.status === 401 && !path.startsWith("/api/auth/")) {
+      window.dispatchEvent(new Event("sre-auth-required"));
+    }
     const message =
       typeof body === "string"
         ? body
@@ -64,6 +78,20 @@ function unwrapRuns(value: Run[] | { runs?: Run[] }): Run[] {
 }
 
 export const api = {
+  auth: {
+    session: (): Promise<AuthSession> => request("/api/auth/session"),
+    login: (token: string): Promise<AuthSession> => request("/api/auth/session", {
+      method: "POST", body: JSON.stringify({ token }),
+    }),
+    logout: (): Promise<unknown> => request("/api/auth/session", { method: "DELETE" }),
+  },
+  knowledge: {
+    status: (): Promise<KnowledgeStatus> => request("/api/knowledge"),
+    search: (query: string): Promise<KnowledgeResults> =>
+      request("/api/knowledge/search", { method: "POST", body: JSON.stringify({ query }) }),
+    reindex: (): Promise<KnowledgeStatus> =>
+      request("/api/knowledge/reindex", { method: "POST" }),
+  },
   runs: {
     async list(): Promise<Run[]> {
       return unwrapRuns(await request<Run[] | { runs?: Run[] }>("/api/runs"));
@@ -116,14 +144,14 @@ export const api = {
         method: "POST",
       });
     },
-    updatePlan(id: string, steps: PlanStep[] | string[]): Promise<Run> {
+    updatePlan(id: string, steps: PlanStep[]): Promise<Run> {
       return request(`/api/runs/${encodeURIComponent(id)}/plan`, {
         method: "PATCH",
         body: JSON.stringify({ steps }),
       });
     },
-    eventsUrl(id: string): string {
-      return `${API_BASE}/api/runs/${encodeURIComponent(id)}/events`;
+    eventsUrl(id: string, afterId = 0): string {
+      return `${API_BASE}/api/runs/${encodeURIComponent(id)}/events?after_id=${afterId}`;
     },
   },
   tools: {

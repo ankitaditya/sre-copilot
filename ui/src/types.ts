@@ -4,6 +4,9 @@ export type RunStatus =
   | "running"
   | "paused"
   | "waiting_approval"
+  | "awaiting_approval"
+  | "needs_human"
+  | "resolved"
   | "completed"
   | "failed"
   | "cancelled"
@@ -19,7 +22,8 @@ export interface PlanStep {
 }
 
 export interface PendingAction {
-  action_id: string;
+  id?: string;
+  action_id?: string;
   name?: string;
   action?: string;
   tool?: string;
@@ -48,7 +52,7 @@ export interface Run {
 }
 
 export interface RunEvent {
-  id: string;
+  id: string | number;
   run_id: string;
   type: string;
   created_at: string;
@@ -70,3 +74,34 @@ export interface HealthStatus {
 }
 
 export type StreamState = "connecting" | "live" | "reconnecting" | "polling";
+
+export interface AuthSession {
+  enabled: boolean;
+  authenticated: boolean;
+  role: "viewer" | "operator" | "approver" | null;
+  csrf_token?: string | null;
+}
+
+export interface KnowledgeMatch {
+  id: string;
+  kind: "runbook" | "incident";
+  source: string;
+  title: string;
+  excerpt: string;
+  score: number;
+}
+
+export interface KnowledgeStatus {
+  documents: number;
+  runbook_chunks: number;
+  incident_chunks: number;
+  embedding_model: string | null;
+  embedded_chunks: number;
+  warnings: string[];
+}
+
+export interface KnowledgeResults {
+  matches: KnowledgeMatch[];
+  mode: string;
+  warnings: string[];
+}

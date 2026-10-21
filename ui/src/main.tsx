@@ -7,6 +7,7 @@ import {
 import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 
 import App from "./App";
+import { AuthGate } from "./components/AuthGate";
 import "./index.css";
 import { darkTheme, lightTheme } from "./styles/theme";
 
@@ -35,13 +36,15 @@ function Root() {
   return (
     <IdPrefixProvider value="sre-copilot-">
       <FluentProvider theme={darkMode ? darkTheme : lightTheme}>
-        <BrowserRouter>
-          <Routes>
-            <Route path="/" element={app} />
-            <Route path="/runs/:runId" element={app} />
-            <Route path="*" element={<Navigate to="/" replace />} />
-          </Routes>
-        </BrowserRouter>
+        <AuthGate>
+          <BrowserRouter>
+            <Routes>
+              <Route path="/" element={app} />
+              <Route path="/runs/:runId" element={app} />
+              <Route path="*" element={<Navigate to="/" replace />} />
+            </Routes>
+          </BrowserRouter>
+        </AuthGate>
       </FluentProvider>
     </IdPrefixProvider>
   );

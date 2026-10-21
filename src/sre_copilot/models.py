@@ -4,7 +4,7 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 def utc_now() -> str:
@@ -82,6 +82,7 @@ class RunState(BaseModel):
     budget: Budget = Field(default_factory=Budget)
     summary: str | None = None
     model_provider: str = "deterministic"
+    action_execution_id: str | None = None
 
 
 class CreateRunRequest(BaseModel):
@@ -123,3 +124,20 @@ class ToolDefinition(BaseModel):
     risk: Literal["read_only", "mutating"]
     input_schema: dict[str, Any]
 
+
+class ModelAnalysis(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    summary: str = Field(min_length=1, max_length=4000)
+    root_cause: str = Field(min_length=1, max_length=500)
+    confidence: int = Field(ge=0, le=100)
+    recommended_tool: str | None = None
+    recommended_args: dict[str, Any] = Field(default_factory=dict)
+    rationale: str = Field(default="", max_length=2000)
+    blast_radius: str = Field(default="", max_length=1000)
+
+
+class KnowledgeSearchRequest(BaseModel):
+    query: str = Field(min_length=1, max_length=2000)
+    limit: int = Field(default=5, ge=1, le=20)
+    service: str | None = Field(default=None, max_length=80)

@@ -4,6 +4,11 @@ import { api } from "../api/client";
 import type { Run, RunEvent, StreamState } from "../types";
 
 const EVENT_NAMES = [
+  "run_created", "run_recovered", "run_paused", "run_resumed", "run_cancelled",
+  "reasoning", "diagnosis", "approval_required", "action_approved", "action_rejected",
+  "operator_guidance", "operator_request", "plan_updated", "tool_call", "tool_result",
+  "tool_retry", "replan", "verification_failed", "run_resolved", "budget_exhausted",
+  "security_blocked", "model_error", "dlp_redacted",
   "run",
   "run.updated",
   "status",
@@ -49,6 +54,7 @@ export function useRunStream({
     let pollingTimer: number | undefined;
     let refreshTimer: number | undefined;
     let failureCount = 0;
+    let lastEventId = 0;
 
     const poll = async () => {
       try {
@@ -97,6 +103,8 @@ export function useRunStream({
             created_at: event.created_at ?? new Date().toISOString(),
             payload: event.payload ?? parsed,
           };
+          const numericId = Number(normalized.id);
+          if (Number.isSafeInteger(numericId)) lastEventId = Math.max(lastEventId, numericId);
           setEvents((current) => {
             if (current.some((item) => item.id === normalized.id)) return current;
             return [...current, normalized].slice(-250);
@@ -118,7 +126,7 @@ export function useRunStream({
     const connect = () => {
       if (disposed) return;
       setState(failureCount ? "reconnecting" : "connecting");
-      source = new EventSource(api.runs.eventsUrl(runId));
+      source = new EventSource(api.runs.eventsUrl(runId, lastEventId), { withCredentials: true });
       source.onopen = () => {
         failureCount = 0;
         stopPolling();

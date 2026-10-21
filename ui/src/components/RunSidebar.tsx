@@ -19,6 +19,7 @@ import {
 
 import { relativeTime } from "../format";
 import type { Run } from "../types";
+import { useAuth } from "./AuthGate";
 import { StatusBadge } from "./StatusBadge";
 
 const useStyles = makeStyles({
@@ -180,6 +181,7 @@ export function RunSidebar({
   onSelect,
   onCreate,
 }: RunSidebarProps) {
+  const { canOperate } = useAuth();
   const styles = useStyles();
   const [query, setQuery] = useState("");
   const [filter, setFilter] = useState<Filter>("all");
@@ -218,6 +220,7 @@ export function RunSidebar({
               icon={<Add24Regular />}
               aria-label="Create incident"
               onClick={onCreate}
+              disabled={!canOperate}
             />
           </Tooltip>
           <Button

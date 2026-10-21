@@ -22,6 +22,7 @@ import {
 import { api, errorMessage } from "../api/client";
 import { normalizedPlan, sentenceCase, stepTitle } from "../format";
 import type { PlanStep, Run } from "../types";
+import { useAuth } from "./AuthGate";
 import { StatusBadge } from "./StatusBadge";
 
 const useStyles = makeStyles({
@@ -111,7 +112,15 @@ interface PlanPanelProps {
   onUpdated: (run: Run) => void;
 }
 
+function isEditableStep(value: unknown): value is PlanStep {
+  return typeof value === "object" && value !== null &&
+    "id" in value && typeof value.id === "string" &&
+    "title" in value && typeof value.title === "string" &&
+    "hypothesis" in value && typeof value.hypothesis === "string";
+}
+
 export function PlanPanel({ run, onUpdated }: PlanPanelProps) {
+  const { canOperate } = useAuth();
   const styles = useStyles();
   const steps = normalizedPlan(run);
   const [editing, setEditing] = useState(false);
@@ -141,7 +150,7 @@ export function PlanPanel({ run, onUpdated }: PlanPanelProps) {
       step.status?.toLowerCase() === "completed" ||
       step.status?.toLowerCase() === "done" ||
       index < currentIndex ||
-      run.status.toLowerCase() === "completed",
+      ["completed", "resolved"].includes(run.status.toLowerCase()),
   ).length;
 
   const save = async () => {
@@ -154,13 +163,9 @@ export function PlanPanel({ run, onUpdated }: PlanPanelProps) {
     }
     if (
       !Array.isArray(parsed) ||
-      !parsed.every(
-        (step) =>
-          typeof step === "string" ||
-          (typeof step === "object" && step !== null),
-      )
+      !parsed.every(isEditableStep)
     ) {
-      setError("Plan must be a JSON array of step strings or objects.");
+      setError("Plan must be a JSON array of objects with id, title, and hypothesis strings.");
       return;
     }
     setSaving(true);
@@ -168,7 +173,7 @@ export function PlanPanel({ run, onUpdated }: PlanPanelProps) {
     try {
       const updated = await api.runs.updatePlan(
         run.id,
-        parsed as PlanStep[] | string[],
+        parsed,
       );
       onUpdated(updated);
       setEditing(false);
@@ -196,7 +201,7 @@ export function PlanPanel({ run, onUpdated }: PlanPanelProps) {
           size="small"
           appearance="subtle"
           icon={<Edit20Regular />}
-          disabled={saving}
+          disabled={saving || !canOperate || run.status !== "paused" || !!run.pending_action}
           onClick={() => {
             setError(null);
             setEditing((value) => !value);
@@ -205,6 +210,8 @@ export function PlanPanel({ run, onUpdated }: PlanPanelProps) {
           {editing ? "Close editor" : "Edit plan"}
         </Button>
       </div>
+      <Caption1>Pause to edit. Preserve scope, evidence, diagnose, remediate, and verify in order.
+        Plans with pending approvals are locked.</Caption1>
 
       {editing ? (
         <div className={styles.editor}>
@@ -255,11 +262,11 @@ export function PlanPanel({ run, onUpdated }: PlanPanelProps) {
                 step.status?.toLowerCase() === "completed" ||
                 step.status?.toLowerCase() === "done" ||
                 index < currentIndex ||
-                run.status.toLowerCase() === "completed";
+                ["completed", "resolved"].includes(run.status.toLowerCase());
               const current =
                 !complete &&
                 index === currentIndex &&
-                run.status.toLowerCase() !== "completed";
+                !["completed", "resolved"].includes(run.status.toLowerCase());
               return (
                 <div className={styles.step} key={step.id ?? index}>
                   <span

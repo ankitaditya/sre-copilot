@@ -30,6 +30,7 @@ import { formatDateTime, isActiveStatus, summaryText } from "../format";
 import { useRunStream } from "../hooks/useRunStream";
 import type { Run } from "../types";
 import { ApprovalCard } from "./ApprovalCard";
+import { useAuth } from "./AuthGate";
 import { EventTimeline } from "./EventTimeline";
 import { FindingsPanel } from "./FindingsPanel";
 import { PlanPanel } from "./PlanPanel";
@@ -180,6 +181,7 @@ export function RunDetail({
   onRefresh,
   onRefreshList,
 }: RunDetailProps) {
+  const { canOperate } = useAuth();
   const styles = useStyles();
   const [actionBusy, setActionBusy] = useState<string | null>(null);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -274,9 +276,9 @@ export function RunDetail({
 
   if (!run) return null;
 
-  const canPause = ["running", "queued"].includes(run.status.toLowerCase());
-  const canResume = run.status.toLowerCase() === "paused";
-  const canCancel = isActiveStatus(run.status);
+  const canPause = canOperate && ["running", "queued", "awaiting_approval"].includes(run.status.toLowerCase());
+  const canResume = canOperate && ["paused", "needs_human"].includes(run.status.toLowerCase());
+  const canCancel = canOperate && isActiveStatus(run.status);
   const budget =
     run.budget === null || run.budget === undefined
       ? ""
@@ -427,6 +429,7 @@ export function RunDetail({
               </Caption1>
               <Textarea
                 value={guidance}
+                disabled={!canOperate || !isActiveStatus(run.status)}
                 onChange={(_, data) => setGuidance(data.value)}
                 rows={4}
                 resize="vertical"
@@ -440,6 +443,7 @@ export function RunDetail({
                   icon={guidanceBusy ? undefined : <Send24Regular />}
                   disabled={
                     guidanceBusy ||
+                    !canOperate ||
                     !guidance.trim() ||
                     guidance.length > 2000 ||
                     !isActiveStatus(run.status)

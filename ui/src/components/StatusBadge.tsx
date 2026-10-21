@@ -6,13 +6,13 @@ function statusColor(value: string): BadgeProps["color"] {
   const status = value.toLowerCase();
   if (["failed", "critical", "cancelled", "error"].includes(status)) return "danger";
   if (
-    ["paused", "high", "waiting_approval", "awaiting_approval", "blocked"].includes(
+    ["paused", "high", "waiting_approval", "awaiting_approval", "needs_human", "blocked"].includes(
       status,
     )
   ) {
     return "warning";
   }
-  if (["completed", "healthy", "ok", "low"].includes(status)) return "success";
+  if (["completed", "resolved", "healthy", "ok", "low"].includes(status)) return "success";
   if (["running", "medium", "queued"].includes(status)) return "informative";
   return "subtle";
 }

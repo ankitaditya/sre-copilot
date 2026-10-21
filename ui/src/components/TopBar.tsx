@@ -1,3 +1,4 @@
+import { useState } from "react";
 import {
   Avatar,
   Body1,
@@ -15,6 +16,8 @@ import {
 } from "@fluentui/react-icons";
 
 import type { HealthStatus } from "../types";
+import { errorMessage } from "../api/client";
+import { useAuth } from "./AuthGate";
 import { StatusBadge } from "./StatusBadge";
 
 const useStyles = makeStyles({
@@ -96,6 +99,8 @@ export function TopBar({
   onToggleTheme,
   onOpenNavigation,
 }: TopBarProps) {
+  const { enabled, role, logout } = useAuth();
+  const [authError, setAuthError] = useState<string | null>(null);
   const styles = useStyles();
   const healthValue = healthLoading
     ? "checking"
@@ -128,6 +133,13 @@ export function TopBar({
         </div>
       </div>
       <div className={styles.actions}>
+        <Caption1 role={authError ? "alert" : undefined}>
+          {authError ?? (enabled ? role : "Local demo - authentication off")}
+        </Caption1>
+        {enabled && <Button appearance="subtle" onClick={() => {
+          setAuthError(null);
+          void logout().catch((reason) => setAuthError(errorMessage(reason)));
+        }}>Sign out</Button>}
         <div className={styles.hideSmall}>
           <StatusBadge value={healthValue} />
         </div>

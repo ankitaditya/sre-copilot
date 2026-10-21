@@ -48,7 +48,7 @@ export function stepTitle(step: PlanStep, index: number): string {
 }
 
 export function isActiveStatus(status: string): boolean {
-  return !["completed", "failed", "cancelled"].includes(status.toLowerCase());
+  return !["completed", "resolved", "failed", "cancelled"].includes(status.toLowerCase());
 }
 
 export function isWaitingStatus(status: string): boolean {

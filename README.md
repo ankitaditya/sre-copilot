@@ -19,6 +19,9 @@ process restart.
 - Retryable tool failures, bounded backoff, replanning, and hard execution budgets
 - Portable `demo-api` fault scenarios that work without external infrastructure
 - Optional local Ollama reasoning with a deterministic offline fallback
+- Indexed runbooks and resolved-incident memory, with optional semantic retrieval
+- Prompt-injection screening, secret/PII redaction, and outbound/tool governance
+- Optional token-based viewer, operator, and approver access with browser sessions
 - React 18, TypeScript, Vite, and Fluent UI operator console
 - Single-container Docker deployment
 
@@ -247,6 +250,112 @@ To run without any model dependency:
 LLM_MODE=deterministic
 ```
 
+## Knowledge and incident memory
+
+At startup, the application indexes local runbooks and resolved incidents in SQLite FTS5.
+Resolved runs are added automatically. Retrieval returns ranked chunks with source identifiers
+and supplies previous incident context to the investigation; it does not automatically apply
+previous fixes or train the model.
+
+The operator console includes a knowledge search panel. Use **Refresh index** after changing
+runbooks; reindexing removes deleted runbooks and replaces changed content. The index shares
+the existing SQLite database and Docker data volume.
+
+Full-text search works offline. To enable hybrid full-text and semantic search:
+
+```bash
+ollama pull nomic-embed-text
+```
+
+`LLM_MODE=deterministic` disables model-based diagnosis. Leave `KNOWLEDGE_EMBEDDING_MODEL`
+empty as well when no model requests should be made.
+
+Set `KNOWLEDGE_EMBEDDING_MODEL=nomic-embed-text` in `.env`, then restart the application or
+recreate the Compose service. Embeddings are cached by content and model; changing the model
+requires reindexing. If embedding generation fails, search falls back to full-text retrieval
+with an explicit warning in the API and UI. No embedding model is downloaded automatically.
+After an embedding failure, refresh the index to retry the model instead of repeatedly
+calling an unavailable endpoint.
+
+Runbooks are screened and redacted before indexing or embedding. Suspicious documents are
+quarantined; symlinks and files larger than 256 KB are skipped. Index capacity and chunk size
+are controlled by `KNOWLEDGE_MAX_DOCUMENTS` and `KNOWLEDGE_CHUNK_SIZE`.
+
+## Security and workflow governance
+
+The built-in protection layer is enforced in the runtime as well as the API:
+
+- **Prompt-injection screening:** checks incident text, operator guidance, tool output,
+  retrieved knowledge, and model responses for instruction overrides and common role-spoofing
+  patterns. Unicode normalization reduces simple obfuscation. Blocked tool content is not
+  passed to the model, and affected investigations stop in `needs_human`.
+- **Data protection:** redacts supported secret formats, configured access tokens, credential
+  assignments, email addresses, SSNs, and Luhn-valid payment-card numbers. Redaction happens
+  before model/embedding requests, new snapshots, events, and knowledge records. Startup also
+  scrubs existing incident snapshots, checkpoint JSON, and event JSON. Sensitive executable
+  tool arguments are rejected instead of silently rewritten.
+- **Execution governance:** tool arguments and model output use strict schemas. Tools and
+  service targets must be allowlisted, including operator-edited approval arguments.
+  A model cannot expand an incident's target. Mutations require the exact pending action ID
+  and arguments; interrupted executions require operator-directed verification after restart
+  rather than automatic re-execution.
+- **Outbound policy:** HTTP health checks are denied by default. `ALLOWED_HTTP_ORIGINS` enables
+  specific scheme/host/port combinations. Model requests use `ALLOWED_MODEL_ORIGINS`.
+  Credentials in URLs, metadata/link-local IP destinations, redirects, oversized responses,
+  and environment proxy inheritance are blocked.
+- **Editable-plan governance (LCNC):** pause a run before editing its plan. Keep the built-in
+  `scope`, `evidence`, `diagnose`, `remediate`, and `verify` stages exactly once and in that
+  order. Progress cannot be forged through a plan update, and pending approvals lock the plan.
+  These controls govern this application's workflows and connectors, not external Power Platform
+  environments.
+
+The default allowed service is `demo-api`. To investigate other local containers, explicitly
+add their exact names to `ALLOWED_SERVICES`. `ALLOWED_TOOLS` can further restrict connectors.
+For example, settings accepting lists use JSON syntax:
+
+```env
+ALLOWED_SERVICES=["demo-api","checkout-api"]
+ALLOWED_HTTP_ORIGINS=["http://127.0.0.1:8001"]
+```
+
+Allowed DNS hostnames are trusted operator configuration: use trusted DNS and network-level
+egress rules in deployment. Pattern screening and redaction are defense-in-depth measures,
+not guarantees that every injection or sensitive-data format can be detected. Original
+runbook/sandbox files, database backups/WAL remnants, and external infrastructure logs are
+outside the redaction layer; protect and retire those separately.
+
+### Enable authenticated access
+
+Authentication is off for the local demo. Enable it before exposing the application:
+
+```env
+AUTH_ENABLED=true
+AUTH_TOKENS={"<viewer-token>":"viewer","<operator-token>":"operator","<approver-token>":"approver"}
+SESSION_TTL_SECONDS=3600
+```
+
+Replace each placeholder with a different random token of at least 32 characters. Generate
+tokens locally, for example with `python -c "import secrets; print(secrets.token_urlsafe(32))"`.
+Do not commit the resulting `.env`. Restart the native process or recreate the Compose service
+after configuration changes.
+
+| Role | Permissions |
+|---|---|
+| Viewer | Read incidents, event streams, knowledge, and security status/audit records |
+| Operator | Viewer permissions plus create/guide/pause/resume/cancel runs, edit plans, and refresh knowledge |
+| Approver | Operator permissions plus approve or reject proposed mutations |
+
+The browser sign-in exchanges a token for a short-lived HttpOnly, SameSite-strict session
+cookie. Mutating cookie-authenticated requests require a CSRF token. Access tokens are not
+stored in browser storage or placed in SSE URLs. Sessions expire and are cleared on process
+restart; sign out revokes the current session. Use HTTPS and `AUTH_COOKIE_SECURE=true` when
+deploying beyond localhost. API clients may instead send `Authorization: Bearer <token>`.
+The `/health` probe remains public.
+
+Policy denials and authenticated operator requests are audited without storing submitted
+credentials. Read policy settings at `/api/security`, audit events at `/api/security/events`,
+and per-run security/redaction events in the incident timeline.
+
 ## Run the demo
 
 1. Select a fault:
@@ -359,6 +468,13 @@ flowchart LR
 | `GET` | `/api/tools` | List tools, schemas, and risk levels |
 | `GET` | `/api/health` | Agent runtime readiness |
 | `GET` | `/health` | Process health |
+| `GET/POST/DELETE` | `/api/auth/session` | Inspect, create, or revoke a browser session |
+| `GET` | `/api/knowledge` | Index status and warnings |
+| `GET` | `/api/knowledge/search?query=...` | Ranked runbook and incident retrieval |
+| `POST` | `/api/knowledge/search` | Search with a JSON body (used by the UI to keep queries out of access-log URLs) |
+| `POST` | `/api/knowledge/reindex` | Refresh runbooks and resolved-incident memory |
+| `GET` | `/api/security` | Effective protection and governance settings |
+| `GET` | `/api/security/events` | Recent authentication and policy audit records |
 
 ## Repository layout
 
@@ -423,14 +539,14 @@ Then open `http://localhost:8081`.
 
 ## Current limitations
 
-- Authentication and role-based approval are not included in this local assessment build.
+- Authentication is opt-in and uses configured local tokens, not enterprise SSO or tenant isolation.
 - SQLite targets a single application replica.
 - Production infrastructure tools need workload identity and narrower authorization policies.
 - Model and remediation expansion should be gated by scenario replay evaluations.
-- Operational event retention and redaction policies must be defined before using sensitive logs.
+- Enterprise DLP connectors, automated retention, and organization-specific data classifiers
+  require separate deployment integration.
 
 ## AI-assisted implementation record
 
 The `ai-log/` directory records the supplied assessment, implementation decisions, validation
 commands, and known limitations. It intentionally excludes private chain-of-thought and secrets.
-

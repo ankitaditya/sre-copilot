@@ -97,7 +97,7 @@ export function KpiCards({
   ).length;
   const waiting = runs.filter((run) => isWaitingStatus(run.status)).length;
   const resolved = runs.filter(
-    (run) => run.status.toLowerCase() === "completed",
+    (run) => ["completed", "resolved"].includes(run.status.toLowerCase()),
   ).length;
 
   const cards = [

@@ -8,22 +8,57 @@ from dataclasses import dataclass
 from typing import Any, Literal
 
 import httpx
+from pydantic import BaseModel, ConfigDict, Field
 
 from sre_copilot.config import Settings
+from sre_copilot.knowledge import KnowledgeIndex
 from sre_copilot.models import ToolDefinition, utc_now
+from sre_copilot.protection import GovernancePolicy, PolicyViolation, bounded_request
 
 ToolHandler = Callable[[dict[str, Any]], Awaitable[dict[str, Any]]]
+
+
+class EmptyArgs(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+
+class LogArgs(EmptyArgs):
+    limit: int = Field(default=80, ge=1, le=200)
+
+
+class SearchArgs(EmptyArgs):
+    query: str = Field(min_length=1, max_length=2000)
+
+
+class HealthArgs(EmptyArgs):
+    url: str = Field(min_length=1, max_length=2000)
+
+
+class ContainerArgs(EmptyArgs):
+    name: str = Field(pattern=r"^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,127}$")
+
+
+class ContainerLogArgs(ContainerArgs):
+    tail: int = Field(default=100, ge=1, le=500)
+
+
+class RestoreArgs(EmptyArgs):
+    expected_fault: str | None = Field(default=None, max_length=80)
+    change_ticket: str | None = Field(default=None, max_length=120)
 
 
 @dataclass(frozen=True)
 class RegisteredTool:
     definition: ToolDefinition
     handler: ToolHandler
+    args_model: type[BaseModel]
 
 
 class ToolRegistry:
     def __init__(self, settings: Settings):
         self._settings = settings
+        self.policy = GovernancePolicy(settings)
+        self.knowledge: KnowledgeIndex | None = None
         self._tools: dict[str, RegisteredTool] = {}
         self._register_defaults()
 
@@ -32,7 +67,7 @@ class ToolRegistry:
         name: str,
         description: str,
         risk: Literal["read_only", "mutating"],
-        input_schema: dict[str, Any],
+        args_model: type[BaseModel],
         handler: ToolHandler,
     ) -> None:
         self._tools[name] = RegisteredTool(
@@ -40,9 +75,10 @@ class ToolRegistry:
                 name=name,
                 description=description,
                 risk=risk,
-                input_schema=input_schema,
+                input_schema=args_model.model_json_schema(),
             ),
             handler,
+            args_model,
         )
 
     def _register_defaults(self) -> None:
@@ -50,84 +86,61 @@ class ToolRegistry:
             "inspect_demo_service",
             "Read the portable demo service state and active fault.",
             "read_only",
-            {"type": "object", "properties": {}},
+            EmptyArgs,
             self._inspect_demo_service,
         )
         self._register(
             "read_demo_logs",
             "Read recent demo service log entries.",
             "read_only",
-            {
-                "type": "object",
-                "properties": {"limit": {"type": "integer", "minimum": 1, "maximum": 200}},
-            },
+            LogArgs,
             self._read_demo_logs,
         )
         self._register(
             "search_runbooks",
             "Search local operational runbooks for relevant procedures.",
             "read_only",
-            {
-                "type": "object",
-                "required": ["query"],
-                "properties": {"query": {"type": "string"}},
-            },
+            SearchArgs,
             self._search_runbooks,
+        )
+        self._register(
+            "search_knowledge",
+            "Search indexed runbooks and resolved incident memory with source citations.",
+            "read_only", SearchArgs, self._search_knowledge,
         )
         self._register(
             "http_healthcheck",
             "Call an HTTP health endpoint and return status and latency.",
             "read_only",
-            {
-                "type": "object",
-                "required": ["url"],
-                "properties": {"url": {"type": "string", "format": "uri"}},
-            },
+            HealthArgs,
             self._http_healthcheck,
         )
         self._register(
             "list_containers",
             "List local Docker containers when Docker is available.",
             "read_only",
-            {"type": "object", "properties": {}},
+            EmptyArgs,
             self._list_containers,
         )
         self._register(
             "get_container_logs",
             "Read bounded logs from a local Docker container.",
             "read_only",
-            {
-                "type": "object",
-                "required": ["name"],
-                "properties": {
-                    "name": {"type": "string"},
-                    "tail": {"type": "integer", "minimum": 1, "maximum": 500},
-                },
-            },
+            ContainerLogArgs,
             self._get_container_logs,
         )
         self._register(
             "restore_demo_service",
             "Clear the injected demo fault and restore the service configuration.",
             "mutating",
-            {
-                "type": "object",
-                "properties": {
-                    "expected_fault": {"type": "string"},
-                    "change_ticket": {"type": "string"},
-                },
-            },
+            RestoreArgs,
             self._restore_demo_service,
         )
         self._register(
             "restart_container",
             "Restart one local Docker container.",
             "mutating",
-            {
-                "type": "object",
-                "required": ["name"],
-                "properties": {"name": {"type": "string"}},
-            },
+            ContainerArgs,
             self._restart_container,
         )
 
@@ -139,19 +152,50 @@ class ToolRegistry:
             raise KeyError(f"Unknown tool: {name}")
         return self._tools[name]
 
-    async def execute(self, name: str, args: dict[str, Any]) -> dict[str, Any]:
-        tool = self.get(name)
+    def validate(
+        self, name: str, args: dict[str, Any], service: str | None = None,
+    ) -> dict[str, Any]:
         try:
+            tool = self.get(name)
+        except KeyError as exc:
+            raise PolicyViolation("unknown_tool") from exc
+        try:
+            validated = tool.args_model.model_validate(args).model_dump(exclude_none=True)
+        except ValueError as exc:
+            raise PolicyViolation("invalid_tool_arguments") from exc
+        self.policy.tool(name, validated, service)
+        return validated
+
+    async def execute(
+        self, name: str, args: dict[str, Any], *, service: str | None = None,
+        approved: bool = False,
+    ) -> dict[str, Any]:
+        try:
+            args = self.validate(name, args, service)
+            tool = self.get(name)
+            if tool.definition.risk == "mutating" and not approved:
+                raise PolicyViolation("approval_required")
             result = await asyncio.wait_for(
                 tool.handler(args), timeout=self._settings.tool_timeout_seconds
             )
-            return {"ok": True, "data": result}
+            cleaned = self.policy.data.clean(result)
+            return {"ok": True, "data": cleaned, "redacted": cleaned != result}
+        except PolicyViolation as exc:
+            return {"ok": False, "error": str(exc), "retryable": False, "policy_blocked": True}
         except TimeoutError:
             return {"ok": False, "error": "tool_timeout", "retryable": True}
-        except (ValueError, KeyError) as exc:
-            return {"ok": False, "error": str(exc), "retryable": False}
-        except (OSError, httpx.HTTPError) as exc:
-            return {"ok": False, "error": str(exc), "retryable": True}
+        except (ValueError, KeyError, OSError, httpx.HTTPError) as exc:
+            try:
+                error = self.policy.data.clean(str(exc))
+            except PolicyViolation as violation:
+                return {
+                    "ok": False, "error": str(violation), "retryable": False,
+                    "policy_blocked": True,
+                }
+            return {
+                "ok": False, "error": error, "retryable": isinstance(exc, (OSError, httpx.HTTPError)),
+                "redacted": error != str(exc),
+            }
 
     async def _inspect_demo_service(self, args: dict[str, Any]) -> dict[str, Any]:
         del args
@@ -171,6 +215,8 @@ class ToolRegistry:
         return {"lines": logs[-limit:], "truncated": len(logs) > limit}
 
     async def _search_runbooks(self, args: dict[str, Any]) -> dict[str, Any]:
+        if self.knowledge is not None:
+            return await self.knowledge.search(str(args["query"]), kind="runbook")
         query = str(args.get("query", "")).strip()
         if not query:
             raise ValueError("query is required")
@@ -187,12 +233,19 @@ class ToolRegistry:
         matches.sort(key=lambda item: item["score"], reverse=True)
         return {"matches": matches[:5]}
 
+    async def _search_knowledge(self, args: dict[str, Any]) -> dict[str, Any]:
+        if self.knowledge is None:
+            raise ValueError("knowledge_index_not_initialized")
+        return await self.knowledge.search(str(args["query"]))
+
     async def _http_healthcheck(self, args: dict[str, Any]) -> dict[str, Any]:
         url = str(args.get("url", ""))
         if not url.startswith(("http://", "https://")):
             raise ValueError("url must use http or https")
-        async with httpx.AsyncClient(timeout=self._settings.tool_timeout_seconds) as client:
-            response = await client.get(url)
+        response = await bounded_request(
+            "GET", url, allowed_origins=self._settings.allowed_http_origins,
+            timeout=self._settings.tool_timeout_seconds, max_bytes=64_000,
+        )
         return {
             "url": url,
             "status_code": response.status_code,
@@ -206,6 +259,9 @@ class ToolRegistry:
             "ps", "--format", "{{json .}}"
         )
         containers = [json.loads(line) for line in output.splitlines() if line.strip()]
+        containers = [
+            item for item in containers if item.get("Names") in self._settings.allowed_services
+        ]
         return {"containers": containers}
 
     async def _get_container_logs(self, args: dict[str, Any]) -> dict[str, Any]:
@@ -261,15 +317,20 @@ class ToolRegistry:
             raise ValueError("invalid container name")
         return name
 
-    @staticmethod
-    async def _docker(*arguments: str) -> str:
+    async def _docker(self, *arguments: str) -> str:
         process = await asyncio.create_subprocess_exec(
             "docker",
             *arguments,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
-        stdout, stderr = await process.communicate()
+        try:
+            async with asyncio.timeout(self._settings.tool_timeout_seconds):
+                stdout, stderr = await process.communicate()
+        finally:
+            if process.returncode is None:
+                process.kill()
+                await process.wait()
         if process.returncode:
             raise OSError(stderr.decode(errors="replace").strip() or "docker command failed")
         return stdout.decode(errors="replace")

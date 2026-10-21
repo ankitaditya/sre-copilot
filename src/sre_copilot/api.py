@@ -4,13 +4,15 @@ import asyncio
 import json
 from collections.abc import AsyncIterator
 
-from fastapi import APIRouter, Header, HTTPException, Request, status
+from fastapi import APIRouter, Depends, Header, HTTPException, Query, Request, status
 from fastapi.responses import StreamingResponse
 
+from sre_copilot.auth import require_role
 from sre_copilot.models import (
     ApprovalRequest,
     CreateRunRequest,
     GuidanceRequest,
+    KnowledgeSearchRequest,
     PlanUpdateRequest,
     RejectionRequest,
     RunState,
@@ -19,7 +21,9 @@ from sre_copilot.runtime import AgentRuntime, RunNotFound, RuntimeConflict
 from sre_copilot.store import RunStore
 from sre_copilot.tools import ToolRegistry
 
-router = APIRouter(prefix="/api", tags=["agent-runtime"])
+router = APIRouter(
+    prefix="/api", tags=["agent-runtime"], dependencies=[Depends(require_role("viewer"))]
+)
 
 
 def _services(request: Request) -> tuple[RunStore, AgentRuntime, ToolRegistry]:
@@ -45,7 +49,10 @@ async def list_tools(request: Request) -> list[dict[str, object]]:
     return [tool.model_dump() for tool in tools.definitions()]
 
 
-@router.post("/runs", response_model=RunState, status_code=status.HTTP_201_CREATED)
+@router.post(
+    "/runs", response_model=RunState, status_code=status.HTTP_201_CREATED,
+    dependencies=[Depends(require_role("operator"))],
+)
 async def create_run(payload: CreateRunRequest, request: Request) -> RunState:
     _, runtime, _ = _services(request)
     return await runtime.create_run(payload)
@@ -79,27 +86,39 @@ async def stream_events(
     run_id: str,
     request: Request,
     last_event_id: int | None = Header(default=None, alias="Last-Event-ID"),
+    after_id: int = Query(default=0, ge=0),
 ) -> StreamingResponse:
     store, _, _ = _services(request)
     if await store.get_run(run_id) is None:
         raise HTTPException(status_code=404, detail="Run not found.")
 
     async def event_stream() -> AsyncIterator[str]:
-        cursor = last_event_id or 0
-        for event in await store.list_events(run_id, after_id=cursor):
-            cursor = event.id
-            yield _sse(event.id, event.type, event.model_dump(mode="json"))
-        iterator = store.subscribe(run_id).__aiter__()
-        while not await request.is_disconnected():
-            try:
-                event = await asyncio.wait_for(iterator.__anext__(), timeout=15)
-                if event.id > cursor:
-                    cursor = event.id
-                    yield _sse(event.id, event.type, event.model_dump(mode="json"))
-            except TimeoutError:
-                yield ": heartbeat\n\n"
-            except StopAsyncIteration:
-                return
+        cursor = max(last_event_id or 0, after_id)
+        iterator = store.subscribe(run_id)
+        pending = asyncio.ensure_future(anext(iterator))
+        await asyncio.sleep(0)
+        try:
+            while not await request.is_disconnected():
+                try:
+                    request.app.state.auth.authorize(request, "viewer")
+                except HTTPException:
+                    return
+                replay = await store.list_events(run_id, after_id=cursor)
+                if replay:
+                    for event in replay:
+                        cursor = event.id
+                        yield _sse(event.id, event.type, event.model_dump(mode="json"))
+                    continue
+                ready, _ = await asyncio.wait({pending}, timeout=15)
+                if not ready:
+                    yield ": heartbeat\n\n"
+                    continue
+                pending.result()
+                pending = asyncio.ensure_future(anext(iterator))
+        finally:
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
+            await iterator.aclose()
 
     return StreamingResponse(
         event_stream(),
@@ -112,7 +131,10 @@ async def stream_events(
     )
 
 
-@router.post("/runs/{run_id}/approve", response_model=RunState)
+@router.post(
+    "/runs/{run_id}/approve", response_model=RunState,
+    dependencies=[Depends(require_role("approver"))],
+)
 async def approve(run_id: str, payload: ApprovalRequest, request: Request) -> RunState:
     _, runtime, _ = _services(request)
     return await _runtime_call(
@@ -120,7 +142,10 @@ async def approve(run_id: str, payload: ApprovalRequest, request: Request) -> Ru
     )
 
 
-@router.post("/runs/{run_id}/reject", response_model=RunState)
+@router.post(
+    "/runs/{run_id}/reject", response_model=RunState,
+    dependencies=[Depends(require_role("approver"))],
+)
 async def reject(run_id: str, payload: RejectionRequest, request: Request) -> RunState:
     _, runtime, _ = _services(request)
     return await _runtime_call(
@@ -128,36 +153,99 @@ async def reject(run_id: str, payload: RejectionRequest, request: Request) -> Ru
     )
 
 
-@router.post("/runs/{run_id}/guide", response_model=RunState)
+@router.post(
+    "/runs/{run_id}/guide", response_model=RunState,
+    dependencies=[Depends(require_role("operator"))],
+)
 async def guide(run_id: str, payload: GuidanceRequest, request: Request) -> RunState:
     _, runtime, _ = _services(request)
     return await _runtime_call(runtime.add_guidance(run_id, payload.message))
 
 
-@router.post("/runs/{run_id}/pause", response_model=RunState)
+@router.post(
+    "/runs/{run_id}/pause", response_model=RunState,
+    dependencies=[Depends(require_role("operator"))],
+)
 async def pause(run_id: str, request: Request) -> RunState:
     _, runtime, _ = _services(request)
     return await _runtime_call(runtime.pause(run_id))
 
 
-@router.post("/runs/{run_id}/resume", response_model=RunState)
+@router.post(
+    "/runs/{run_id}/resume", response_model=RunState,
+    dependencies=[Depends(require_role("operator"))],
+)
 async def resume(run_id: str, request: Request) -> RunState:
     _, runtime, _ = _services(request)
     return await _runtime_call(runtime.resume(run_id))
 
 
-@router.post("/runs/{run_id}/cancel", response_model=RunState)
+@router.post(
+    "/runs/{run_id}/cancel", response_model=RunState,
+    dependencies=[Depends(require_role("operator"))],
+)
 async def cancel(run_id: str, request: Request) -> RunState:
     _, runtime, _ = _services(request)
     return await _runtime_call(runtime.cancel(run_id))
 
 
-@router.patch("/runs/{run_id}/plan", response_model=RunState)
+@router.patch(
+    "/runs/{run_id}/plan", response_model=RunState,
+    dependencies=[Depends(require_role("operator"))],
+)
 async def update_plan(
     run_id: str, payload: PlanUpdateRequest, request: Request
 ) -> RunState:
     _, runtime, _ = _services(request)
     return await _runtime_call(runtime.update_plan(run_id, payload.steps))
+
+
+@router.get("/knowledge")
+async def knowledge_status(request: Request):
+    return await request.app.state.runtime.knowledge.status()
+
+
+@router.get("/knowledge/search")
+async def search_knowledge(
+    request: Request, query: str = Query(min_length=1, max_length=2000),
+    limit: int = Query(default=5, ge=1, le=20), service: str | None = None,
+):
+    if service is not None:
+        request.app.state.tools.policy.service(service)
+    return await request.app.state.runtime.knowledge.search(query, limit, service)
+
+
+@router.post("/knowledge/reindex", dependencies=[Depends(require_role("operator"))])
+async def reindex_knowledge(request: Request):
+    return await request.app.state.runtime.knowledge.rebuild()
+
+
+@router.post("/knowledge/search")
+async def search_knowledge_body(payload: KnowledgeSearchRequest, request: Request):
+    if payload.service is not None:
+        request.app.state.tools.policy.service(payload.service)
+    return await request.app.state.runtime.knowledge.search(
+        payload.query, payload.limit, payload.service
+    )
+
+
+@router.get("/security")
+async def security_status(request: Request):
+    settings = request.app.state.tools.policy.settings
+    return {
+        "authentication_enabled": settings.auth_enabled,
+        "prompt_screening": True, "dlp_redaction": True,
+        "allowed_services": settings.allowed_services,
+        "allowed_tools": settings.allowed_tools,
+        "allowed_http_origins": settings.allowed_http_origins,
+        "allowed_model_origins": settings.allowed_model_origins,
+        "plan_governance": "ordered_safety_stages_required",
+    }
+
+
+@router.get("/security/events")
+async def security_events(request: Request, limit: int = Query(default=100, ge=1, le=250)):
+    return await request.app.state.store.security_events(limit)
 
 
 async def _runtime_call(awaitable):

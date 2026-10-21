@@ -56,7 +56,14 @@ the UI, then builds the container after both jobs succeed.
   handlers. Tools access portable sandbox JSON, local Markdown runbooks, HTTP, or Docker.
   `llm.py` supplies optional Ollama diagnosis and recommendations, not execution authority.
   `LLM_MODE=auto` falls back to deterministic diagnosis; `deterministic` skips Ollama;
-  explicit `ollama` mode propagates model-client errors.
+  explicit `ollama` mode records model errors and stops in `needs_human`.
+- `protection.py` centralizes injection screening, DLP redaction, service/tool policies,
+  and bounded outbound requests. Keep new ingestion, model, storage, and execution paths
+  behind these controls. `auth.py` provides optional bearer/session authentication and
+  viewer/operator/approver roles; cookie-authenticated mutations require CSRF protection.
+- `knowledge.py` indexes sanitized runbooks and resolved incidents into SQLite FTS5,
+  optionally adding cached Ollama embeddings for hybrid search. Index/query failures
+  must be surfaced as warnings rather than presented as successful semantic retrieval.
 - The React 18/TypeScript console uses Fluent UI v9. `main.tsx` supplies themes and
   `/runs/:runId` routing; `App.tsx` owns run selection/list state; `RunDetail` composes
   operator controls and panels. REST calls go through `ui/src/api/client.ts`.
@@ -94,9 +101,12 @@ the UI, then builds the container after both jobs succeed.
   runbooks, and use `llm_mode="deterministic"` to avoid external model dependencies.
   Async pytest tests/fixtures use the configured `asyncio_mode="auto"`.
 - The service name `demo-api` selects the portable JSON-based evidence/remediation path;
-  other service names select local Docker-container tools. Seed demo state with
+  other explicitly allowlisted service names select local Docker-container tools. Seed demo state with
   `python sandbox/chaos.py db-down` (also `bad-config`, `latency`, or `healthy`).
-  Runbook search reads top-level `runbooks/*.md` and ranks keyword matches.
+  The knowledge index ingests top-level `runbooks/*.md`; refresh it after runbook edits.
+- Plan edits require a paused run without a pending action and must retain ordered safety
+  stages. Persist the action-execution marker before mutations so restart recovery verifies
+  interrupted changes instead of re-executing them.
 - `ai-log/README.md` describes the source-controlled AI assistance record. Exported
   transcripts for assessment submissions must exclude credentials, machine-specific
   secrets, and private chain-of-thought.

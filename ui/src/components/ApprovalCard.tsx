@@ -23,6 +23,7 @@ import {
 import { api, errorMessage } from "../api/client";
 import { sentenceCase } from "../format";
 import type { PendingAction, Run } from "../types";
+import { useAuth } from "./AuthGate";
 
 const useStyles = makeStyles({
   card: {
@@ -77,6 +78,8 @@ export function ApprovalCard({
   onUpdated,
 }: ApprovalCardProps) {
   const styles = useStyles();
+  const { canApprove } = useAuth();
+  const actionId = action.id ?? action.action_id;
   const [args, setArgs] = useState("");
   const [reason, setReason] = useState("");
   const [busy, setBusy] = useState<"approve" | "reject" | null>(null);
@@ -86,9 +89,10 @@ export function ApprovalCard({
     setArgs(JSON.stringify(action.args ?? {}, null, 2));
     setReason("");
     setError(null);
-  }, [action.action_id, action.args]);
+  }, [actionId, action.args]);
 
   const approve = async () => {
+    if (!actionId || !canApprove) return;
     let parsed: unknown;
     try {
       parsed = args.trim() ? JSON.parse(args) : undefined;
@@ -99,7 +103,7 @@ export function ApprovalCard({
     setBusy("approve");
     setError(null);
     try {
-      onUpdated(await api.runs.approve(runId, action.action_id, parsed));
+      onUpdated(await api.runs.approve(runId, actionId, parsed));
     } catch (requestError) {
       setError(errorMessage(requestError));
     } finally {
@@ -108,11 +112,12 @@ export function ApprovalCard({
   };
 
   const reject = async () => {
+    if (!actionId || !canApprove) return;
     setBusy("reject");
     setError(null);
     try {
       onUpdated(
-        await api.runs.reject(runId, action.action_id, reason.trim() || undefined),
+        await api.runs.reject(runId, actionId, reason.trim() || undefined),
       );
     } catch (requestError) {
       setError(errorMessage(requestError));
@@ -133,7 +138,8 @@ export function ApprovalCard({
         </Subtitle2>
       </div>
       <Caption1 as="p" className={styles.description}>
-        Review the exact action and arguments before authorizing execution.
+        {canApprove ? "Review the exact action and arguments before authorizing execution."
+          : "An approver must authorize or reject this action."}
       </Caption1>
       <div className={styles.fields}>
         <div>
@@ -153,6 +159,7 @@ export function ApprovalCard({
             resize="vertical"
             rows={8}
             value={args}
+            disabled={!canApprove}
             onChange={(_, data) => setArgs(data.value)}
             aria-label="Action arguments as JSON"
           />
@@ -160,6 +167,7 @@ export function ApprovalCard({
         <Field label="Rejection reason (optional)">
           <Input
             value={reason}
+            disabled={!canApprove}
             onChange={(_, data) => setReason(data.value)}
             placeholder="Explain why this action should not proceed"
           />
@@ -173,7 +181,7 @@ export function ApprovalCard({
           <Button
             appearance="secondary"
             icon={busy === "reject" ? undefined : <Dismiss24Regular />}
-            disabled={busy !== null}
+            disabled={busy !== null || !canApprove || !actionId}
             onClick={reject}
           >
             {busy === "reject" ? (
@@ -185,7 +193,7 @@ export function ApprovalCard({
           <Button
             appearance="primary"
             icon={busy === "approve" ? undefined : <Checkmark24Regular />}
-            disabled={busy !== null}
+            disabled={busy !== null || !canApprove || !actionId}
             onClick={approve}
           >
             {busy === "approve" ? (
